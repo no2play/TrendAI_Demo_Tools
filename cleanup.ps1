@@ -1,4 +1,4 @@
-# PML Test Cleanup v2
+# PML Test Cleanup v3
 $ErrorActionPreference = 'SilentlyContinue'
 
 Write-Host '[*] Removing file artifacts...'

@@ -1,35 +1,32 @@
 #!/usr/bin/env python3
 """
-PML Dual-Detection Test Builder  v2
+PML Dual-Detection Test Builder  v3
 Apex One Predictive Machine Learning - File + Process Detection Validation
 
-Changes from v1:
-  - Fixed: suspicious APIs now in static IAT (not dynamic GetProcAddress)
-  - Fixed: .payload section uses GCC __attribute__((section)) not MSVC #pragma
-  - Fixed: section marked executable (xr flags via linker script)
-  - Fixed: overlay uses RC4-keystream pattern (not os.urandom white noise)
+Changes from v2:
+  - Fixed: linker script removed (ELF phdr syntax invalid for PE targets)
+  - Fixed: .payload executable flag now set via objcopy post-compile step
+  - Added: --check-env  validates mingw + objcopy availability before build
+  - Added: --compile    runs full compile + objcopy sequence automatically
 
 Usage:
-  python build.py --build               generate all source artifacts
-  python build.py --overlay <pml.exe>   append RC4-pattern overlay to PE
-  python build.py --clean               remove output directory
+  python build.py --build                   generate source artifacts
+  python build.py --compile                 build + compile + objcopy + overlay
+  python build.py --overlay <pml.exe>       append RC4-pattern overlay to PE
+  python build.py --check-env               verify mingw tools are available
+  python build.py --clean                   remove output directory
 """
 
-import os, sys, base64, argparse, shutil
+import os, sys, base64, argparse, shutil, subprocess
 
-OUT_DIR = "pml_test_output_v2"
+OUT_DIR = "pml_test_output_v3"
+
+GCC     = "x86_64-w64-mingw32-gcc"
+OBJCOPY = "x86_64-w64-mingw32-objcopy"
 
 # ───────────────────────────────────────────────────────────────────────────────
-#  RC4-KEYSTREAM OVERLAY
-#  Replaces os.urandom() from v1.
-#
-#  os.urandom() fails ATSE's packer-pattern model because:
-#    - Chi-square ~492,000  (should be ~255-300 for real encrypted data)
-#    - Arithmetic mean ~81  (should be ~127.5)
-#    - Serial correlation ~0.40 (should be ~0.0)
-#
-#  RC4 keystream is the correct model: statistically near-uniform (Chi ~270),
-#  mean ~127, correlation ~0.0 — matches real AES/RC4 encrypted payload regions.
+#  RC4-KEYSTREAM  (correct packer-entropy profile)
+#  Chi-sq ~270, mean ~129, serial corr ~-0.02  vs  os.urandom chi-sq 492k
 # ───────────────────────────────────────────────────────────────────────────────
 def rc4_keystream(size, seed_key=b'\xDE\xAD\xBE\xEF\xCA\xFE\xBA\xBE'):
     S = list(range(256))
@@ -50,15 +47,9 @@ def append_overlay(pe_path, size=8192):
     overlay = rc4_keystream(size)
     with open(pe_path, "ab") as f:
         f.write(overlay)
-    print("[+] Overlay appended : {} bytes (RC4-keystream pattern)".format(size))
+    print("[+] Overlay appended : {} bytes (RC4-keystream)".format(size))
     print("[i] Final file size  : {:,} bytes".format(os.path.getsize(pe_path)))
 
-# ───────────────────────────────────────────────────────────────────────────────
-#  HIGH-ENTROPY .payload SECTION  (RC4, 512 bytes)
-#  GCC/mingw uses __attribute__((section(".payload"))) — NOT #pragma section.
-#  The old #pragma section + __declspec(allocate) are MSVC-only and silently
-#  ignored by GCC, meaning no .payload section was ever created in v1.
-# ───────────────────────────────────────────────────────────────────────────────
 def gen_payload_section(size=512):
     return rc4_keystream(size, seed_key=b'\xBA\xDC\x0F\xFE\xDE\xAD\xC0\xDE')
 
@@ -71,7 +62,6 @@ def fmt_c_bytes(data, cols=16, indent=4):
 
 # ───────────────────────────────────────────────────────────────────────────────
 #  STAGE 4 — JScript (cscript.exe)
-#  Signal: 3rd distinct script engine completing the chain
 # ───────────────────────────────────────────────────────────────────────────────
 STAGE4_LINES = [
     "// PML Test - Stage 4 (JScript via cscript.exe)",
@@ -87,7 +77,6 @@ STAGE4_LINES = [
 
 # ───────────────────────────────────────────────────────────────────────────────
 #  STAGE 3 — VBScript (wscript.exe)
-#  Signals: HKCU\Run persistence | %APPDATA% write | wscript->cscript hop
 # ───────────────────────────────────────────────────────────────────────────────
 def build_stage3_vbs():
     lines = [
@@ -104,7 +93,7 @@ def build_stage3_vbs():
         '    "wscript.exe """ & WScript.ScriptFullName & """", _',
         '    "REG_SZ"',
         "",
-        "' Drop Stage 4 JScript line-by-line (avoids multi-level quote nesting)",
+        "' Drop Stage 4 JScript line-by-line",
         'jp = sh.ExpandEnvironmentStrings("%TEMP%") & "\\pml_s4.js"',
         "Set fh = fs.OpenTextFile(jp, 2, True)",
     ]
@@ -119,8 +108,7 @@ def build_stage3_vbs():
     return "\n".join(lines) + "\n"
 
 # ───────────────────────────────────────────────────────────────────────────────
-#  STAGE 2 — PowerShell (-EncodedCommand, launched by cmd.exe)
-#  Signals: -NoProfile -Hidden -Bypass -EncodedCommand | IEX | %APPDATA% write
+#  STAGE 2 — PowerShell (-EncodedCommand)
 # ───────────────────────────────────────────────────────────────────────────────
 def build_stage2_ps1(vbs_b64):
     return "\n".join([
@@ -140,69 +128,47 @@ def b64_utf8(s):
     return base64.b64encode(s.encode("utf-8")).decode("ascii")
 
 # ───────────────────────────────────────────────────────────────────────────────
-#  LINKER SCRIPT — sets .payload section flags to executable + readable
+#  C SOURCE  v3
 #
-#  GCC alone cannot set PE section flags via source code.
-#  A linker script is the correct mechanism.  Without this, .payload
-#  is data-only (r/w), which is less anomalous.  With executable flag,
-#  ATSE sees: high-entropy section + executable = shellcode staging pattern.
-# ───────────────────────────────────────────────────────────────────────────────
-LINKER_SCRIPT = """\
-/* pml_sections.ld
- * Forces .payload section to be marked executable + readable in the PE.
- * High-entropy + executable = shellcode staging signal for ATSE.
- */
-SECTIONS
-{
-  .payload : { *(.payload) } :text
-}
-INSERT AFTER .text;
-"""
-
-# ───────────────────────────────────────────────────────────────────────────────
-#  C SOURCE — PE Dropper Stub  v2
+#  Section fix:
+#    v2 used #pragma section (MSVC) → GCC warning + section not created
+#    v2 also tried linker script with :text phdr → PE doesn't have phdrs → error
 #
-#  Key fixes from v1:
-#
-#  FIX 1 — Static IAT population (replaces dynamic GetProcAddress chain)
-#  ─────────────────────────────────────────────────────────────────────
-#  v1 used:  pVA = (pfnVirtualAlloc) GetProcAddress(hK32, "VirtualAlloc");
-#  PROBLEM:  Dynamic resolution does NOT add APIs to the PE's IAT.
-#            ATSE reads the import table from the PE header — APIs resolved
-#            at runtime via GetProcAddress are completely invisible to it.
-#  FIX:      Directly call the APIs (even with trivial/safe arguments) so
-#            the linker is forced to add them to the IAT.
-#
-#  FIX 2 — GCC-compatible section attribute
-#  ─────────────────────────────────────────
-#  v1 used:  #pragma section(".payload") + __declspec(allocate(".payload"))
-#  PROBLEM:  Both are MSVC-only extensions.  GCC/mingw silently ignores them
-#            (hence the "allocate attribute directive ignored" warning).
-#            No .payload section was ever created in the compiled PE.
-#  FIX:      Use GCC's __attribute__((section(".payload"))) which mingw
-#            correctly translates to a named PE section.
+#    v3 solution:
+#      Source:   __attribute__((section(".payload"), used))  → GCC creates section
+#      Compile:  no linker script needed (plain gcc flags)
+#      Post-build: objcopy --set-section-flags .payload=code,readonly
+#                  → sets IMAGE_SCN_CNT_CODE | IMAGE_SCN_MEM_READ | IMAGE_SCN_MEM_EXECUTE
+#                  → ATSE sees: high-entropy + executable section = shellcode staging
 # ───────────────────────────────────────────────────────────────────────────────
 C_TEMPLATE = """\
 /*
- * pml_dropper_stub.c  v2
+ * pml_dropper_stub.c  v3
  * ─────────────────────────────────────────────────────────────────────────────
- * Static signals (ATSE scans before execution):
+ * Static signals (ATSE feature extraction):
  *   [1] IAT: VirtualAlloc, VirtualProtect, WriteProcessMemory,
- *            CreateRemoteThread — directly called, appear in import table
- *   [2] IAT: VirtualFree, GetCurrentProcess — consistent injection context
- *   [3] .payload section: 512 B RC4-keystream, entropy ~7.95 bpb, executable
- *   [4] XOR decode stub: tight loop matching packer opcode signatures
- *   [5] Unsigned PE: no Authenticode, no version info, no manifest
- *   [6] Overlay: 8 KB RC4-keystream appended post-build (dropper pattern)
+ *            CreateRemoteThread  --  direct calls, appear in PE import table
+ *   [2] .payload section: 512 B RC4-keystream, entropy ~7.95 bpb
+ *            executable flag set post-build via objcopy (shellcode staging)
+ *   [3] XOR decode stub: tight loop matching packer opcode signatures
+ *   [4] Unsigned PE: no Authenticode, no version info, no manifest
+ *   [5] Overlay: 8 KB RC4-keystream appended post-build
  *
- * Behavioral chain (CIE observes after execution):
+ * Behavioral chain (CIE telemetry):
  *   PE -> cmd.exe -> powershell.exe
  *      (-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -EncodedCommand)
  *      -> wscript.exe pml_s3.vbs  (HKCU Run persistence + drop JScript)
  *      -> cscript.exe pml_s4.js   (3rd engine: completion marker)
  *
- * CONTROLLED TEST ARTIFACT - no real injection, no real shellcode executed.
- * All sensitive API calls use safe arguments that produce no actual effect.
+ * Compile (no linker script needed in v3):
+ *   x86_64-w64-mingw32-gcc -o pml_test.exe dropper_stub.c
+ *       -mwindows -O2 -s -Wl,--strip-all -lkernel32 -luser32
+ *
+ * Post-build (set .payload executable flag):
+ *   x86_64-w64-mingw32-objcopy
+ *       --set-section-flags .payload=code,readonly pml_test.exe
+ *
+ * CONTROLLED TEST ARTIFACT - no real injection or shellcode executed.
  */
 #include <windows.h>
 #include <stdio.h>
@@ -211,15 +177,18 @@ C_TEMPLATE = """\
 /*
  * High-entropy .payload section
  *
- * GCC/mingw syntax: __attribute__((section(".payload")))
- * DO NOT use #pragma section + __declspec(allocate) — those are MSVC-only
- * and are silently ignored by GCC (causing the v1 "allocate attribute
- * directive ignored" warning and no section being created).
+ * GCC syntax: __attribute__((section(".payload"), used))
+ *   - section(".payload")  creates a named PE section
+ *   - used                 prevents the compiler from discarding the symbol
+ *                          as unreferenced dead code
  *
- * 512 bytes of RC4-keystream data: entropy ~7.95 bpb.
- * ATSE flags PE sections with entropy > 7.0 as packed/encrypted content.
- * Non-standard section name is an additional structural anomaly.
- * Executable flag (set via linker script) makes this a shellcode-staging signal.
+ * Executable flag is set AFTER compilation by:
+ *   objcopy --set-section-flags .payload=code,readonly pml_test.exe
+ *
+ * Do NOT use:
+ *   #pragma section         -- MSVC-only, silently ignored by GCC
+ *   __declspec(allocate)    -- MSVC-only, produces "allocate ignored" warning
+ *   Linker script :phdr     -- ELF concept, PE has no phdrs, causes ld error
  */
 static const unsigned char g_payload[{entropy_sz}]
     __attribute__((section(".payload"), used)) = {{
@@ -228,12 +197,9 @@ static const unsigned char g_payload[{entropy_sz}]
 
 /*
  * XOR decode stub
- * Opcode pattern: XOR byte ptr [reg+offset], imm8  (0x80 /6 ib)
- * This is the canonical single-byte XOR loop emitted by Emotet/TrickBot/Ryuk
- * packer stubs.  ATSE's opcode feature extractor assigns a high-weight score
- * to this pattern regardless of surrounding context.
- * __attribute__((noinline)) prevents the compiler from inlining or
- * vectorising the loop, which would change the opcode signature.
+ * Opcode: XOR byte ptr [reg+offset], imm8  (0x80 /6)
+ * Matches Emotet / TrickBot / Ryuk packer entry stubs.
+ * noinline preserves the loop opcode pattern.
  */
 static __attribute__((noinline))
 void xor_decode(unsigned char * restrict buf, size_t len, unsigned char key)
@@ -243,15 +209,10 @@ void xor_decode(unsigned char * restrict buf, size_t len, unsigned char key)
         buf[i] ^= key;
 }}
 
-/*
- * Encoded behavioral chain (UTF-16LE base64 for -EncodedCommand)
- * cmd.exe /c powershell.exe
- *     -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass
- *     -EncodedCommand <b64>
- */
+/* Encoded behavioral chain (UTF-16LE base64 for -EncodedCommand) */
 static const char g_enc[] = "{encoded_cmd}";
 
-/* ── Process chain launcher ──────────────────────────────────────────────── */
+/* Process chain launcher */
 static BOOL launch_chain(void)
 {{
     STARTUPINFOA        si;
@@ -276,7 +237,6 @@ static BOOL launch_chain(void)
                           NULL, NULL, &si, &pi);
 }}
 
-/* ── WinMain ─────────────────────────────────────────────────────────────── */
 int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR lpCmd, int nShow)
 {{
     LPVOID  pMem;
@@ -287,80 +247,120 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR lpCmd, int nShow)
     (void)hPrev; (void)lpCmd; (void)nShow;
 
     /*
-     * FIX 1: Static IAT population via direct API calls
-     * ─────────────────────────────────────────────────
-     * Each call below is safe — trivial arguments that produce no real effect
-     * (NULL handles, 0 sizes, MEM_RESERVE without MEM_COMMIT, etc.).
-     * The SOLE purpose is to force the linker to add each API to the PE's IAT,
-     * making them visible to ATSE's import table feature extractor.
+     * Static IAT population via direct calls
+     * ───────────────────────────────────────
+     * All four calls use safe/trivial arguments (no real injection occurs).
+     * Purpose: force linker to add each API to the PE IAT so ATSE can read
+     * the injection capability fingerprint from the import table header.
      *
-     * Injection capability fingerprint this creates in the IAT:
-     *   VirtualAlloc          HIGH SIGNAL  memory allocation (stage 1 of injection)
-     *   VirtualProtect        HIGH SIGNAL  RWX permission change
-     *   VirtualFree           context      paired with VirtualAlloc
-     *   WriteProcessMemory    HIGH SIGNAL  cross-process write
-     *   CreateRemoteThread    HIGH SIGNAL  remote code execution
-     *   GetCurrentProcess     context      pseudo-handle, common in injectors
+     * Without direct calls, GetProcAddress resolution is invisible to ATSE
+     * because it happens at runtime, not at PE parse time.
      */
 
-    /* VirtualAlloc: reserve 4 KB in own process — no actual allocation */
+    /* VirtualAlloc: reserve only (no MEM_COMMIT) — no real memory allocated */
     pMem = VirtualAlloc(NULL, 4096, MEM_RESERVE, PAGE_NOACCESS);
 
-    /* VirtualProtect: change protection on the reserved region — no-op if
-     * pMem is NULL (which it will be on MEM_RESERVE without MEM_COMMIT) */
+    /* VirtualProtect: no-op if pMem is NULL */
     if (pMem)
         VirtualProtect(pMem, 4096, PAGE_EXECUTE_READ, &dwOld);
 
-    /* VirtualFree: release immediately — net effect is zero */
+    /* VirtualFree: release immediately */
     if (pMem)
         VirtualFree(pMem, 0, MEM_RELEASE);
 
-    /* WriteProcessMemory: write 0 bytes to own process — succeeds silently */
+    /* WriteProcessMemory: 0 bytes to own process — succeeds, writes nothing */
     WriteProcessMemory(GetCurrentProcess(), &scratch, &scratch, 0, &written);
 
-    /* CreateRemoteThread: NULL entry point on own process, CREATE_SUSPENDED.
-     * Will fail (returns NULL) but the IAT entry is what matters. */
+    /* CreateRemoteThread: NULL entry point — will fail, handle closed safely */
     CloseHandle(
         CreateRemoteThread(GetCurrentProcess(), NULL, 0,
                            NULL, NULL, CREATE_SUSPENDED, NULL)
     );
 
-    /* XOR stub: decode 16 bytes of g_payload — emits the packer opcode pattern */
+    /* XOR stub: emit packer opcode pattern on 16 bytes of .payload data */
     memcpy(scratch, g_payload, sizeof(scratch));
     xor_decode(scratch, sizeof(scratch), 0x55);
     (void)scratch;
 
-    /* Launch behavioral chain:
-     * PE -> cmd.exe -> powershell (encoded)
-     *    -> wscript.exe (VBScript: HKCU Run + drop JScript)
-     *    -> cscript.exe (JScript: completion marker)
-     */
+    /* Launch behavioral chain */
     if (!launch_chain())
         return 1;
 
-    /* Stay alive so CIE records the parent-child process linkage */
+    /* Stay alive so CIE records parent-child process linkage */
     Sleep(5000);
     return 0;
 }}
 """
 
 # ───────────────────────────────────────────────────────────────────────────────
-#  COMPILE COMMAND  (printed in README + build output)
-#  -T pml_sections.ld    applies linker script for executable .payload flag
-#  -Wl,--enable-stdcall-fixup  avoids missing-symbol noise on some mingw builds
+#  ENV CHECK
 # ───────────────────────────────────────────────────────────────────────────────
-COMPILE_CMD = (
-    "x86_64-w64-mingw32-gcc -o pml_test.exe dropper_stub.c \\\n"
-    "    -mwindows -O2 -s -Wl,--strip-all \\\n"
-    "    -T pml_sections.ld \\\n"
-    "    -lkernel32 -luser32"
-)
+def check_env():
+    ok = True
+    for tool in [GCC, OBJCOPY]:
+        try:
+            r = subprocess.run([tool, "--version"],
+                               capture_output=True, text=True)
+            ver = r.stdout.splitlines()[0] if r.stdout else "(no output)"
+            print("  [+] {} -- {}".format(tool, ver))
+        except FileNotFoundError:
+            print("  [!] {} -- NOT FOUND".format(tool))
+            ok = False
+    return ok
+
+# ───────────────────────────────────────────────────────────────────────────────
+#  FULL COMPILE SEQUENCE  (--compile flag)
+# ───────────────────────────────────────────────────────────────────────────────
+def run_compile(outdir):
+    src  = os.path.join(outdir, "dropper_stub.c")
+    exe  = os.path.join(outdir, "pml_test.exe")
+
+    # Step 1: gcc
+    gcc_cmd = [
+        GCC, "-o", exe, src,
+        "-mwindows", "-O2", "-s", "-Wl,--strip-all",
+        "-lkernel32", "-luser32"
+    ]
+    print("[*] Compiling...")
+    print("    " + " ".join(gcc_cmd))
+    r = subprocess.run(gcc_cmd, capture_output=True, text=True)
+    if r.returncode != 0:
+        print("[!] Compile failed:\n" + r.stderr)
+        return False
+    if r.stderr.strip():
+        print("    Warnings: " + r.stderr.strip())
+    print("    [+] Compiled: {:,} bytes".format(os.path.getsize(exe)))
+
+    # Step 2: objcopy -- set .payload executable
+    # code      = IMAGE_SCN_CNT_CODE       (marks as code section)
+    # readonly  = IMAGE_SCN_MEM_READ       (readable)
+    # Together these cause the linker/loader to also set MEM_EXECUTE on PE sections
+    obj_cmd = [
+        OBJCOPY,
+        "--set-section-flags", ".payload=code,readonly",
+        exe
+    ]
+    print("[*] Setting .payload section flags (executable)...")
+    print("    " + " ".join(obj_cmd))
+    r = subprocess.run(obj_cmd, capture_output=True, text=True)
+    if r.returncode != 0:
+        print("[!] objcopy failed:\n" + r.stderr)
+        print("    (continuing — section may not have executable flag)")
+    else:
+        print("    [+] .payload flags set: code + readonly (execute)")
+
+    # Step 3: overlay
+    print("[*] Appending RC4-keystream overlay (8192 bytes)...")
+    append_overlay(exe)
+
+    print("\n[+] Final binary: {}".format(exe))
+    return True
 
 # ───────────────────────────────────────────────────────────────────────────────
 #  CLEANUP SCRIPT
 # ───────────────────────────────────────────────────────────────────────────────
 CLEANUP_PS1 = "\n".join([
-    "# PML Test Cleanup v2",
+    "# PML Test Cleanup v3",
     "$ErrorActionPreference = 'SilentlyContinue'",
     "",
     "Write-Host '[*] Removing file artifacts...'",
@@ -389,117 +389,98 @@ CLEANUP_PS1 = "\n".join([
 # ───────────────────────────────────────────────────────────────────────────────
 #  README
 # ───────────────────────────────────────────────────────────────────────────────
-def build_readme(compile_cmd):
-    return """\
-# Apex One PML Dual-Detection Test  v2
-
-## What This Tests
-
-| Phase | Engine | Expected Alert | Action |
-|---|---|---|---|
-| File drop (no execution) | ATSE -> PML File Model | File Detection | Quarantine |
-| Execution (chain runs) | CIE -> PML Process Model | Process Detection | Terminate + Clean |
+README_MD = """\
+# Apex One PML Dual-Detection Test  v3
 
 ## Detection Chain
 
 ```
-pml_test.exe  (unsigned PE / IAT: VirtualAlloc+WPM+CRT / .payload entropy 7.95 / overlay)
-  +-- cmd.exe                      [signal: abnormal parent-child]
-       +-- powershell.exe          [signal: -NoProfile -Hidden -Bypass -EncodedCommand]
-            +-- [decode + drop]    [signal: in-memory exec, %APPDATA% write]
-                 +-- wscript.exe   [signal: PS->wscript cross-engine hop]
-                      +-- pml_s3.vbs  [signal: HKCU Run key persistence]
-                           +-- cscript.exe pml_s4.js  [signal: 3rd script engine]
+pml_test.exe  (unsigned PE / IAT: VirtualAlloc+WPM+CRT / .payload xr 7.95bpb / RC4 overlay)
+  +-- cmd.exe                      [abnormal parent-child]
+       +-- powershell.exe          [-NoProfile -Hidden -Bypass -EncodedCommand]
+            +-- [decode + drop]    [IEX equivalent, %APPDATA% write]
+                 +-- wscript.exe   [PS->wscript engine hop]
+                      +-- pml_s3.vbs  [HKCU Run key persistence]
+                           +-- cscript.exe pml_s4.js  [3rd script engine]
 ```
 
-## What Changed from v1
-
-| Issue | v1 (broken) | v2 (fixed) |
-|---|---|---|
-| Suspicious APIs in IAT | Dynamic GetProcAddress — NOT in IAT | Direct calls — appear in static IAT |
-| .payload section | #pragma section (MSVC-only, ignored by GCC) | __attribute__((section)) — GCC native |
-| Overlay entropy pattern | os.urandom() — chi-sq 492k, mean 81 | RC4-keystream — chi-sq ~270, mean ~127 |
-| .payload executable flag | Not set | Set via linker script (pml_sections.ld) |
-
-## Prerequisites (build machine only)
-
-- mingw-w64: `choco install mingw`  or  https://www.mingw-w64.org
-- Python 3.x
-
-## Step 1 — Generate source files
+## Build (two commands, no linker script needed)
 
 ```bash
-python build.py --build
-```
+# 1. Compile
+x86_64-w64-mingw32-gcc -o pml_test.exe dropper_stub.c \\
+    -mwindows -O2 -s -Wl,--strip-all \\
+    -lkernel32 -luser32
 
-## Step 2 — Compile (no warnings expected)
+# 2. Set .payload section executable (PE section flag — no ELF phdr involved)
+x86_64-w64-mingw32-objcopy \\
+    --set-section-flags .payload=code,readonly \\
+    pml_test.exe
 
-```bash
-""" + compile_cmd + """
-```
-
-## Step 3 — Append RC4-pattern overlay
-
-```bash
+# 3. Append overlay
 python build.py --overlay pml_test.exe
 ```
 
-## Step 4 — Verify entropy profile
+Or run all three steps automatically:
+```bash
+python build.py --compile
+```
+
+## Why No Linker Script
+
+v2 used a linker script with `:text` phdr syntax.
+PE/COFF has no program headers (phdrs are an ELF concept).
+mingw-ld refuses to assign a PE section to a non-existent phdr -> link error.
+
+v3 solution: compile normally, then use `objcopy --set-section-flags` to
+set `IMAGE_SCN_CNT_CODE | IMAGE_SCN_MEM_READ` on `.payload` post-build.
+The PE loader maps code-flagged sections as executable.
+
+## Verify entropy after build
 
 ```bash
 ent pml_test.exe
 # Target:
-#   Entropy          > 7.0 bits/byte
-#   Chi-square       ~300-600 (realistic for PE + encrypted sections)
-#   Arithmetic mean  > 100
-#   Serial corr.     < 0.15
+#   Entropy         > 7.0 bits/byte
+#   Chi-square      < 1000
+#   Arithmetic mean > 110
+#   Serial corr.    < 0.15
 ```
 
-## Step 5 — File Detection Test
+## Test Execution
 
-1. Copy `pml_test.exe` to a watched directory on the test endpoint
-2. Do NOT execute yet
-3. Observe Apex One / Vision One for **File Detection alert**
-4. Verify: malware type classification + Quarantine action
+**File Detection:**
+1. Copy `pml_test.exe` to watched directory on test endpoint
+2. Do NOT execute
+3. Verify File Detection alert + Quarantine in Vision One
 
-## Step 6 — Process Detection Test
+**Process Detection:**
+1. Set PML File action to `Log only`
+2. Execute `pml_test.exe` (silent, no visible windows)
+3. Check `%TEMP%\\pml_done.txt` exists (Stage 4 completion marker)
+4. Verify Process Detection alert + Terminate in Vision One
 
-1. Set PML **File action** to `Log only` in Apex One policy
-2. Execute `pml_test.exe` (runs silently, all windows hidden)
-3. Verify `%TEMP%\\pml_done.txt` exists (Stage 4 completion marker)
-4. Observe Vision One for **Process Detection alert**
-5. Verify: behavioral malware type + Terminate action
-
-## Step 7 — Cleanup
+## Cleanup
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File cleanup.ps1
 ```
-
-Restore PML File action to original setting.
-
-## Tuning Tips
-
-| Issue | Action |
-|---|---|
-| File detection not firing | Raise PML monitoring level; verify ATSE cloud connectivity |
-| Process detection not firing | Confirm CIE active; check script engine monitoring policy |
-| Chain killed by quarantine | Set File action = Log only before executing |
-| Want different SHA256 | Change seed_key bytes in `gen_payload_section()` and rebuild |
 """
 
 # ───────────────────────────────────────────────────────────────────────────────
 #  MAIN
 # ───────────────────────────────────────────────────────────────────────────────
 def main():
-    ap = argparse.ArgumentParser(description="PML Dual-Detection Test Builder v2")
-    ap.add_argument("--build",   action="store_true")
-    ap.add_argument("--overlay", metavar="EXE")
-    ap.add_argument("--clean",   action="store_true")
-    ap.add_argument("--outdir",  default=OUT_DIR)
+    ap = argparse.ArgumentParser(description="PML Dual-Detection Test Builder v3")
+    ap.add_argument("--build",     action="store_true", help="Generate source artifacts")
+    ap.add_argument("--compile",   action="store_true", help="Build + compile + objcopy + overlay")
+    ap.add_argument("--overlay",   metavar="EXE",       help="Append RC4 overlay to compiled PE")
+    ap.add_argument("--check-env", action="store_true", help="Check mingw tools available")
+    ap.add_argument("--clean",     action="store_true", help="Remove output directory")
+    ap.add_argument("--outdir",    default=OUT_DIR)
     args = ap.parse_args()
 
-    if not any([args.build, args.overlay, args.clean]):
+    if not any([args.build, args.compile, args.overlay, args.check_env, args.clean]):
         ap.print_help()
         return
 
@@ -509,77 +490,75 @@ def main():
             print("[+] Removed {}/".format(args.outdir))
         return
 
+    if args.check_env:
+        print("[*] Checking build environment...")
+        check_env()
+        return
+
     if args.overlay:
         append_overlay(args.overlay)
         return
 
-    # ── BUILD ──────────────────────────────────────────────────────────────────
+    # ── GENERATE SOURCE ────────────────────────────────────────────────────────
     os.makedirs(args.outdir, exist_ok=True)
     print("[*] Output directory : {}/\n".format(args.outdir))
 
     print("[*] Stage 3  Building VBScript...")
-    s3_vbs = build_stage3_vbs()
-    s3_b64 = b64_utf8(s3_vbs)
+    s3_vbs  = build_stage3_vbs()
+    s3_b64  = b64_utf8(s3_vbs)
     print("    VBS raw   : {:,} chars".format(len(s3_vbs)))
-    print("    VBS b64   : {:,} chars".format(len(s3_b64)))
 
     print("[*] Stage 2  Building PowerShell + encoding...")
     s2_ps1  = build_stage2_ps1(s3_b64)
     enc_cmd = encode_for_encoded_command(s2_ps1)
-    print("    PS1 raw   : {:,} chars".format(len(s2_ps1)))
     print("    ENC length: {:,} chars  (cmd.exe limit: 8191)".format(len(enc_cmd)))
     if len(enc_cmd) > 7800:
-        print("    [!] WARNING - encoded command approaching cmd.exe line limit")
+        print("    [!] WARNING - approaching cmd.exe line limit")
 
     print("[*] Generating .payload section (RC4-keystream, 512 bytes)...")
     entropy = gen_payload_section(512)
 
-    print("[*] Building C source (v2 fixes applied)...")
+    print("[*] Building C source...")
     c_src = C_TEMPLATE.format(
         entropy_sz  = len(entropy),
         entropy_arr = fmt_c_bytes(entropy),
         encoded_cmd = enc_cmd,
     )
 
-    def write(name, content, mode="w"):
+    def write(name, content):
         path = os.path.join(args.outdir, name)
-        if mode == "wb":
-            with open(path, "wb") as fh:
-                fh.write(content)
-        else:
-            with open(path, "w", encoding="utf-8") as fh:
-                fh.write(content)
-        print("    [+] {:<30s} ({:,} bytes)".format(name, os.path.getsize(path)))
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(content)
+        print("    [+] {:<28s} ({:,} bytes)".format(name, os.path.getsize(path)))
 
     print("[*] Writing files...")
-    write("dropper_stub.c",   c_src)
-    write("pml_sections.ld",  LINKER_SCRIPT)
-    write("cleanup.ps1",      CLEANUP_PS1)
-    write("README.md",        build_readme(COMPILE_CMD))
+    write("dropper_stub.c", c_src)
+    write("cleanup.ps1",    CLEANUP_PS1)
+    write("README.md",      README_MD)
     with open(__file__, "r", encoding="utf-8") as src:
         write("build.py", src.read())
 
     sep = "=" * 62
-    print("""
-{}
-  Build complete.  v2 fixes applied:
-    [1] Suspicious APIs now in static IAT (direct calls)
-    [2] .payload section uses GCC __attribute__((section))
-    [3] Overlay uses RC4-keystream (not os.urandom)
-    [4] .payload marked executable via linker script
+    print("\n" + sep)
+    print("  Source generated.  Next steps:\n")
+    print("  Compile + objcopy + overlay (all-in-one):")
+    print("    python build.py --compile\n")
+    print("  Or manually:")
+    print("    {} -o pml_test.exe dropper_stub.c \\".format(GCC))
+    print("        -mwindows -O2 -s -Wl,--strip-all \\")
+    print("        -lkernel32 -luser32\n")
+    print("    {} --set-section-flags .payload=code,readonly pml_test.exe\n".format(OBJCOPY))
+    print("    python build.py --overlay pml_test.exe\n")
+    print("  Verify: ent pml_test.exe  (target: entropy > 7.0, chi-sq < 1000)")
+    print(sep)
 
-  Compile:
-    {}
-
-  Append overlay:
-    python build.py --overlay pml_test.exe
-
-  Verify entropy:
-    ent pml_test.exe
-    (target: entropy > 7.0, chi-sq < 600, mean > 100)
-
-  Then follow README.md for test execution steps.
-{}""".format(sep, COMPILE_CMD.replace("\\\n    ", " \\\n    "), sep))
+    # ── AUTO COMPILE if --compile flag set ────────────────────────────────────
+    if args.compile:
+        print()
+        if not check_env():
+            print("[!] Missing tools — install mingw-w64 first")
+            return
+        run_compile(args.outdir)
 
 if __name__ == "__main__":
     main()
