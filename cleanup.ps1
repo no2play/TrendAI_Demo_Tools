@@ -1,4 +1,4 @@
-# PML Test Cleanup - removes all test artifacts
+# PML Test Cleanup v2
 $ErrorActionPreference = 'SilentlyContinue'
 
 Write-Host '[*] Removing file artifacts...'
