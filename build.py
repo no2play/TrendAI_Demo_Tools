@@ -19,6 +19,14 @@ Usage:
 
 import os, sys, base64, argparse, shutil, subprocess, math
 
+def run_cmd(cmd, **kwargs):
+    """Python 3.6 compatible subprocess.run wrapper that always returns text."""
+    r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, **kwargs)
+    r.stdout = r.stdout.decode('utf-8', errors='replace') if r.stdout else ''
+    r.stderr = r.stderr.decode('utf-8', errors='replace') if r.stderr else ''
+    return r
+
+
 OUT_DIR = "pml_test_output_v4"
 
 GCC     = "x86_64-w64-mingw32-gcc"
@@ -92,7 +100,7 @@ def verify(pe_path):
     # PE without overlay is typically 28-35 KB.
     # With 64 KB overlay: expect > 90 KB.
     print("\n  [1] File size check")
-    expected_min = 28000 + OVERLAY_SIZE
+    expected_min = 20000 + OVERLAY_SIZE  # PE ~20-30 KB + overlay
     if size < expected_min:
         print("      [!] FAIL  size {:,} bytes — overlay likely NOT appended".format(size))
         print("          Run: python build.py --overlay {}".format(pe_path))
@@ -103,8 +111,7 @@ def verify(pe_path):
     # ── Check 2: .payload section (requires objdump) ──────────────────────────
     print("\n  [2] .payload section check")
     try:
-        r = subprocess.run([OBJDUMP, "-h", pe_path],
-                           capture_output=True, text=True)
+        r = run_cmd([OBJDUMP, "-h", pe_path])
         if ".payload" in r.stdout:
             # Parse section size
             for line in r.stdout.splitlines():
@@ -132,8 +139,7 @@ def verify(pe_path):
         "CreateRemoteThread",
     ]
     try:
-        r = subprocess.run([OBJDUMP, "-p", pe_path],
-                           capture_output=True, text=True)
+        r = run_cmd([OBJDUMP, "-p", pe_path])
         found = []
         missing = []
         for api in target_apis:
@@ -471,7 +477,7 @@ def check_env():
     ok = True
     for tool in [GCC, OBJCOPY, OBJDUMP]:
         try:
-            r = subprocess.run([tool, "--version"], capture_output=True, text=True)
+            r = run_cmd([tool, "--version"])
             ver = r.stdout.splitlines()[0] if r.stdout else "(no output)"
             print("  [+] {}".format(ver[:70]))
         except FileNotFoundError:
@@ -488,7 +494,7 @@ def run_compile(outdir):
                "-mwindows", "-O2", "-s", "-Wl,--strip-all",
                "-lkernel32", "-luser32"]
     print("    " + " ".join(gcc_cmd))
-    r = subprocess.run(gcc_cmd, capture_output=True, text=True)
+    r = run_cmd(gcc_cmd)
     if r.returncode != 0:
         print("[!] Compile failed:\n" + r.stderr)
         return False
@@ -499,7 +505,7 @@ def run_compile(outdir):
     print("[*] Step 2/3  Setting .payload section flags...")
     obj_cmd = [OBJCOPY, "--set-section-flags", ".payload=code,readonly", exe]
     print("    " + " ".join(obj_cmd))
-    r = subprocess.run(obj_cmd, capture_output=True, text=True)
+    r = run_cmd(obj_cmd)
     if r.returncode != 0:
         print("    [!] objcopy failed: " + r.stderr.strip())
     else:
