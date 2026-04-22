@@ -167,28 +167,33 @@ def verify(pe_path):
     else:
         print("      [?] SKIP  {} not available".format(OBJDUMP))
 
-    # [3] IAT check — note: UPX stubs have minimal imports (only what stub needs)
+    # [3] IAT check
+    # After UPX packing the stub IAT only has LoadLibraryA + GetProcAddress
+    # (the decompressor resolves everything else at runtime from UPX1).
+    # Use the -h output from check [2] to determine if UPX is present,
+    # then gate the missing-API verdict accordingly.
     print("\n  [3] IAT check")
     if tool_available(OBJDUMP):
-        r = run_cmd([OBJDUMP, "-p", pe_path])
-        # After UPX packing, the original imports are compressed into UPX1.
-        # The stub's IAT only contains LoadLibraryA + GetProcAddress.
-        # This is CORRECT — it matches how real UPX-packed malware looks.
+        rp = run_cmd([OBJDUMP, "-p", pe_path])   # imports
+        rh = run_cmd([OBJDUMP, "-h", pe_path])   # section names
+        is_upx_packed = "UPX0" in rh.stdout or "UPX1" in rh.stdout
+
         target_apis = ["VirtualAlloc", "VirtualProtect",
                        "WriteProcessMemory", "CreateRemoteThread"]
-        found   = [a for a in target_apis if a in r.stdout]
-        missing = [a for a in target_apis if a not in r.stdout]
+        found   = [a for a in target_apis if a in rp.stdout]
+        missing = [a for a in target_apis if a not in rp.stdout]
 
-        if found:
-            for a in found:
-                print("      [+] FOUND  {}".format(a))
+        for a in found:
+            print("      [+] FOUND    {}".format(a))
+
         if missing:
-            # Check if UPX-packed (missing APIs are expected after UPX)
-            if "UPX0" in r.stdout or "UPX1" in r.stdout:
+            if is_upx_packed:
+                # UPX stub IAT is intentionally minimal — this is correct behaviour.
+                # Original IAT is inside the compressed UPX1 section.
+                # ATSE's deep decompression analysis recovers and scores these.
                 for a in missing:
-                    print("      [~] {} not in stub IAT (expected — UPX compresses".format(a))
-                    print("                original IAT into UPX1 section)")
-                print("      [+] This is correct UPX-packed malware behaviour")
+                    print("      [~] EXPECTED {} compressed into UPX1 (correct)".format(a))
+                print("      [+] UPX-packed IAT is normal — ATSE recovers via decompression")
             else:
                 for a in missing:
                     print("      [!] MISSING  {}".format(a))
